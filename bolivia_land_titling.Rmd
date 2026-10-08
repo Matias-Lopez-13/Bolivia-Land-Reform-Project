@@ -1,0 +1,590 @@
+---
+title: "Reconsidering how land titling could affect conflict between indigenous and
+  non-indigenous peasants in Bolivia"
+output:
+  pdf_document: default
+  word_document:
+    reference_docx: null
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  cache   = TRUE
+)
+
+
+```
+
+```{r libraries}
+library(tidyverse)
+library(glmmTMB)
+library(sjPlot)
+library(broom.mixed)
+library(ggplot2)
+library(patchwork)
+library(sf)
+library(geodata)
+library(stringdist)
+library(brms)
+library(posterior)
+library(bayesplot)
+```
+
+
+
+```{r load-data}
+bolivia <- read_csv(
+  "https://raw.githubusercontent.com/Matias-Lopez-13/Bolivia-Land-Reform-Project/main/bolivia.csv"
+)
+```
+
+```{r clean-data}
+# Download Bolivia municipality shapefile
+bol_shp <- gadm("BOL", level = 3, path = tempdir()) %>% st_as_sf()
+
+# Summarise for maps
+bol_summary <- bolivia %>%
+  group_by(Municipality) %>%
+  summarise(
+    total_titles    = sum(Title_check, na.rm = TRUE),
+    total_protests  = sum(N_protests, na.rm = TRUE),
+    mean_indigenous = mean(indigenous_percent2012, na.rm = TRUE)
+  )
+
+bol_map <- bol_shp %>%
+  left_join(bol_summary, by = c("NAME_3" = "Municipality"))
+
+# Build department lookup and deduplicate
+dept_lookup <- bol_map %>%
+  st_drop_geometry() %>%
+  select(NAME_2, NAME_3) %>%
+  distinct()
+
+dept_lookup_clean <- dept_lookup %>%
+  distinct(NAME_3, .keep_all = TRUE)
+
+# Clean municipality names and join department
+bolivia <- bolivia %>%
+  mutate(Municipality_clean = case_when(
+    Municipality == "San Antonio De Esmoruco"  ~ "San Antonio de Esmoruco",
+    Municipality == "San Pedro De Curahuara"   ~ "San Pedro de Curahuara",
+    Municipality == "Curahuara De Carangas"    ~ "Curahuara de Carangas",
+    Municipality == "Cruz De Machacamarca"     ~ "Cruz de Machacamarca",
+    Municipality == "San Pedro De Tiquina"     ~ "San Pedro de Tiquina",
+    Municipality == "Nazacara De Pacajes"      ~ "Nazacara de Pacajes",
+    Municipality == "San Pedro De Quemes"      ~ "San Pedro de Quemes",
+    Municipality == "Santiago De Machaca"      ~ "Santiago de Machaca",
+    Municipality == "Santiago De Huata"        ~ "Santiago de Huata",
+    Municipality == "Waldo Ballivián"          ~ "Waldo Ballivian",
+    Municipality == "Colpa Belgica"            ~ "Colpa Bélgica",
+    Municipality == "Puerto Suárez"            ~ "Puerto Suarez",
+    Municipality == "Salinas De Garci Mendoza" ~ "Salinas de Garcí Mendoza",
+    Municipality == "Santa Cruz De La Sierra"  ~ "Santa Cruz de la Sierra",
+    Municipality == "San Antonio De Lomerío"   ~ "San Antonio de Lomerio",
+    Municipality == "Ascensión De Guarayos"    ~ "Ascención de Guarayos",
+    Municipality == "Yamparaez"                ~ "Yamparáez",
+    Municipality == "Postrer Valle"            ~ "Postrervalle",
+    Municipality == "Jesús De Machaca"         ~ "Jesús de Machaka",
+    Municipality == "Sopachuy"                 ~ "Sopachui",
+    Municipality == "Urubichá"                 ~ "Urubicha",
+    Municipality == "Villamontes"              ~ "Villa Montes",
+    Municipality == "Belén De Andamarca"       ~ "Belén de Andamarca",
+    Municipality == "Choque Cota"              ~ "Choquecota",
+    Municipality == "Bolívar"                  ~ "Bolivar",
+    Municipality == "Vitichi"                  ~ "Vitiche",
+    Municipality == "Zudáñez"                  ~ "Zudañez",
+    Municipality == "Moro Moro"                ~ "Moromoro",
+    Municipality == "Sica Sica"                ~ "Sicasica",
+    Municipality == "Yunguyo De Litoral"       ~ "Yunguyo del Litoral",
+    Municipality == "Carmen Rivero Tórrez"     ~ "El Carmen Rivero Tórrez",
+    Municipality == "Gral Saavedra"            ~ "General Saavedra",
+    Municipality == "Pari - Paria - Soracachi" ~ "Soracachi",
+    Municipality == "Pto Carabuco"             ~ "Puerto Carabuco",
+    Municipality == "San Andrés De Machaca"    ~ "San Andrés de Machaca",
+    Municipality == "San Ignacio De Velasco"   ~ "San Ignacio de Velasco",
+    Municipality == "San José De Chiquitos"    ~ "San José de Chiquitos",
+    Municipality == "San Juan De Yapacaní"     ~ "San Juan del Yapacaní",
+    Municipality == "San Miguel De Velasco"    ~ "San Miguel de Velasco",
+    Municipality == "San Pablo De Lipez"       ~ "San Pablo de Lípez",
+    Municipality == "San Pedro De Totora"      ~ "San Pedro de Totora",
+    Municipality == "Santa Ana De Yacuma"      ~ "Santa Ana de Yacuma",
+    Municipality == "Santa Rosa Del Sara"      ~ "Santa Rosa del Sara",
+    Municipality == "Santiago De Andamarca"    ~ "Santiago de Andamarca",
+    Municipality == "Sp De Buena Vista"        ~ "San Pedro de Buena Vista",
+    Municipality == "Villa Nueva (Loma Alta)"  ~ "Villa Nueva",
+    TRUE ~ Municipality
+  )) %>%
+  left_join(dept_lookup_clean, by = c("Municipality_clean" = "NAME_3"))
+
+# Create lags
+bolivia <- bolivia %>%
+  arrange(Municipality, Year) %>%
+  group_by(Municipality) %>%
+  mutate(
+    Title_lag1 = lag(Title_check, 1),
+    Title_lag2 = lag(Title_check, 2),
+    Title_lag3 = lag(Title_check, 3)
+  ) %>%
+  ungroup()
+
+# Restrict to good data window
+dat <- bolivia %>% filter(Year >= 2006 & Year <= 2009)
+```
+
+## Introduction
+
+The policy framework for agrarian reforms in Latin America seems to have shifted from a focus on class conflict between lords and peasants (xxxx) towards a focus on conflict between historically discriminated ethnic groups and the state (xxxx). While indigenous peoples and descendants of enslaved peoples have benefitted from this new policy framework, the shift from class to race is not without potential problems.
+
+Based on the qualitative case study of the municipality of Apolo in Bolivia, Fontana (2014) argued that the identity criterion can foster conflict within the peasantry. The study shows that unionized non-indigenous peasants in Apolo resented what they perceived to be unfair advantages of indigenous groups who received land titles from Bolivia's more recent and highly ethnicized agrarian reform. Thus, the vessel for conflict resolution between indigenous peoples and the state inadvertently generated new grounds for conflict between unionized non-indigenous peasants and indigenous peoples.
+
+While the mechanism within the Apolo case seems clear, the external validity of the argument remains speculative. On average, does this new type of agrarian reform tend to foster conflict among peasants? While it is hard to answer this question definitively, we can provide a framework for testing a descriptive hypothesis that associates the recognition of ancestral land and conflict with non-indigenous peasant groups.
+
+Until now this was hard to do because standardized nationwide data on conflict in Bolivia was not available. We partnered with Fundación UNIR Bolivia (www.unirbolivia.org), which uses national and regional media sources to take note of protests in all municipalities. Using protest as a proxy for conflict, we were able to map these events and match them with the creation of new ethic-based territories. These are called Native Communal Territory, *Tierra Comunitaria de Origen*, from now on TCO. The data are far from perfect, presenting some inconsistencies. Therefore a significant share of our research was dedicated to cleaning and fixing the data. We ended up with a sample of four years of detailed information about conflicts, which is the data we use in our estimations.
+
+Our general goal was to test if countrywide data would be consistent with the causal processes that seems to have taken place in the municipality of Apolo. This implies working with two rival hypotheses. The most straightforward is the sharp null: Land titling has no effect on posterior conflict. The second rival states the opposite: Land titling reduces posterior conflict. Naturally, the prior expectation supports this second rival hypothesis because it seems safe to assume that governments implement recognition policies under the idea that these will solve, not cause, conflict.
+
+## What we know about conflict among peasants
+
+Some literature refers to conflict among peasants as "communal conflict," as a way of emphasizing its low intensity (Brosché 2015). However research on other regions (mainly the Middle East and Africa) suggest that these conflicts can challenge social stability when they mobilize ethnic divides (Gurr 1993), which is not how Latin American cases are usually interpreted (Gurr 1995).
+
+However, authors have argued that the salience of race and ethnicity has emerged as the authoritarian regimes responsible for suppressing it transitioned to democracy, opening the way for competitive politics and more protagonism of local organizations (Yashar 2005; Andolina et al. 2009; Rousseau & Dargent 2019).
+
+Many authors associate violent conflict and ethnically diverse societies (Fearon & Laitin 2003; Collier & Hoeffler 2004; Miguel et al. 2004; Montalvo & Reynal-Querol 2005), and Latin America is certainly diverse. This type of conflict can be understood as an intense emotional reaction to grievances driven by ethnic cleavages (Alesina et al.1999; Alesina & La Ferrara 2005).
+
+Others have emphasized that ethnic identities and cleavages are more likely shaped by politics rather than the other way around (Chandra 2012; Singh and Vom Hau 2016; Wimmer 2013). For instance, researchers have examined how the institutionalization of ethnic divisions—such as through censuses or official ethnic certifications—can create competitive dynamics that increase the risk of escalating conflict (Lieberman and Singh 2012 and 2017). Therefore, the institutional context within which ethnic practices occur may be the most critical factor (Wimmer 2013).
+
+## About the data
+
+We have data from 2004 to 2019, however the data are inconsistent. We therefore opted to work on a smaller window of higher quality data, which is flagged in Figure 1.
+
+**Figure 1: Distribution of land titles and conflict**
+
+```{r figure1, fig.width=9, fig.height=6}
+good_start <- 2006
+good_end   <- 2009
+
+bracket_y_protests <- max(bolivia %>% group_by(Year) %>%
+                            summarise(t = sum(N_protests, na.rm = TRUE)) %>%
+                            pull(t)) * 1.1
+
+bracket_y_titles <- max(bolivia %>% group_by(Year) %>%
+                          summarise(t = sum(Title_check, na.rm = TRUE)) %>%
+                          pull(t)) * 1.1
+
+p_protests <- bolivia %>%
+  group_by(Year) %>%
+  summarise(total = sum(N_protests, na.rm = TRUE)) %>%
+  ggplot(aes(x = Year, y = total)) +
+  geom_col(fill = "#87CEEB", width = 0.7) +
+  geom_text(aes(label = total), vjust = -0.5, size = 3, color = "grey30") +
+  annotate("segment", x = good_start, xend = good_end,
+           y = bracket_y_protests, yend = bracket_y_protests,
+           linewidth = 0.7, color = "grey20") +
+  annotate("segment", x = good_start, xend = good_start,
+           y = bracket_y_protests, yend = bracket_y_protests * 0.95,
+           linewidth = 0.7, color = "grey20") +
+  annotate("segment", x = good_end, xend = good_end,
+           y = bracket_y_protests, yend = bracket_y_protests * 0.95,
+           linewidth = 0.7, color = "grey20") +
+  annotate("text", x = mean(c(good_start, good_end)),
+           y = bracket_y_protests * 1.05,
+           label = "Good data", size = 3, color = "grey20") +
+  scale_x_continuous(breaks = 2004:2019) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(title = "Total protests per year", x = NULL, y = "Number of protests") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor   = element_blank())
+
+p_titles_bar <- bolivia %>%
+  group_by(Year) %>%
+  summarise(total = sum(Title_check, na.rm = TRUE)) %>%
+  ggplot(aes(x = Year, y = total)) +
+  geom_col(fill = "#C0392B", width = 0.7) +
+  geom_text(aes(label = total), vjust = -0.5, size = 3, color = "grey30") +
+  annotate("segment", x = good_start, xend = good_end,
+           y = bracket_y_titles, yend = bracket_y_titles,
+           linewidth = 0.7, color = "grey20") +
+  annotate("segment", x = good_start, xend = good_start,
+           y = bracket_y_titles, yend = bracket_y_titles * 0.95,
+           linewidth = 0.7, color = "grey20") +
+  annotate("segment", x = good_end, xend = good_end,
+           y = bracket_y_titles, yend = bracket_y_titles * 0.95,
+           linewidth = 0.7, color = "grey20") +
+  annotate("text", x = mean(c(good_start, good_end)),
+           y = bracket_y_titles * 1.05,
+           label = "Good data", size = 3, color = "grey20") +
+  scale_x_continuous(breaks = 2004:2019) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(title = "Total land titles issued per year", x = NULL, y = "Number of titles") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor   = element_blank())
+
+p_titles_bar / p_protests +
+  plot_annotation(
+    title   = "Land titling and protest activity in Bolivia (2004–2019)",
+    caption = "Source: INRA / protest dataset",
+    theme   = theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 13))
+  )
+```
+
+This window accounts for a total of 1,997 observations of municipality-years. Map 1 shows the spatial distribution of TCOs and protests.
+
+**Map 1: Distribution of TCOs and protests in Bolivia**
+
+```{r map1, fig.width=10, fig.height=6}
+my_pal <- c("#87CEEB", "#C0392B")
+
+apolo <- bol_map %>%
+  filter(NAME_3 == "Apolo") %>%
+  st_centroid() %>%
+  st_coordinates() %>%
+  as.data.frame()
+
+p_titles_map <- ggplot(bol_map) +
+  geom_sf(aes(fill = total_titles), color = "white", linewidth = 0.1) +
+  scale_fill_gradient(low = my_pal[1], high = my_pal[2],
+                      na.value = "grey85", name = "Titles") +
+  annotate("segment",
+           x = apolo$X + 2, y = apolo$Y + 2,
+           xend = apolo$X, yend = apolo$Y,
+           arrow = arrow(length = unit(0.2, "cm"), type = "closed"),
+           color = "black", linewidth = 0.6) +
+  annotate("text", x = apolo$X + 2.1, y = apolo$Y + 2.2,
+           label = "Apolo", size = 3, hjust = 0, fontface = "bold") +
+  labs(title = "Land titles issued") +
+  theme_void(base_size = 11) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+
+p_protests_map <- ggplot(bol_map) +
+  geom_sf(aes(fill = total_protests), color = "white", linewidth = 0.1) +
+  scale_fill_gradient(low = my_pal[1], high = my_pal[2],
+                      na.value = "grey85", name = "Protests") +
+  annotate("segment",
+           x = apolo$X + 2, y = apolo$Y + 2,
+           xend = apolo$X, yend = apolo$Y,
+           arrow = arrow(length = unit(0.2, "cm"), type = "closed"),
+           color = "black", linewidth = 0.6) +
+  annotate("text", x = apolo$X + 2.1, y = apolo$Y + 2.2,
+           label = "Apolo", size = 3, hjust = 0, fontface = "bold") +
+  labs(title = "Protests") +
+  theme_void(base_size = 11) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+
+p_titles_map + p_protests_map
+```
+
+Our intuition was to treat these as count data, i.e. count the number of titles and the number of protests based on a model to test if both counts are associated. Because the quality of data is not perfect, and because our test implies the contrast between two different theories about the effect of land titles in Bolivia, we decided for two distinct approaches.
+
+First, we use zero-inflated negative binomial models which allows us to account for violations of the assumptions of a Poisson distribution. The conditional count component models the expected number of protests as a function of land titles issued, indigenous population percentage, poverty rate, population growth, internal migration, illiteracy rate, forested area, cultivated area, travel time to the departmental capital, municipal area, working-age population share, and the share of population living outside urban centers. All time-invariant controls are drawn from the 2012 national census.
+
+To account for the nested structure of the data — municipalities observed repeatedly over time — the model includes municipality-level random intercepts, allowing baseline protest propensity to vary across units independently of the covariates. A second specification adds department-level random intercepts with municipalities nested within departments, accounting for the possibility that unobserved regional factors (INRA office capacity, departmental politics, geographic clustering of land conflict) jointly predict titling and protest. Coefficients are reported as incidence rate ratios (IRR), where values below 1 indicate a negative association between the predictor and protest frequency. Standard errors are clustered at the municipality level.
+
+Second, we use a Bayesian version of these same models to more clearly contrast the three competing theories: TCOs positively affect protest vs TCOs do not affect protest vs TCOs negatively affect protest. The Bayesian model also accounts for overdispersed count data and includes municipality-level random intercepts to capture unobserved heterogeneity across units, while controlling for key socioeconomic covariates such as poverty, demographics, land use, and accessibility. Weakly informative priors are used to regularize parameter estimates, and posterior distributions are summarized to assess both the magnitude and directional probability of the effect.
+
+We inform the prior belief in H2 using a sensitivity analysis approach, i.e. a range of different prior likelihoods which reflect mild to strong negative effects of land titling on conflict.
+
+## Results
+
+```{r models, results='hide'}
+# Baseline model
+m_lag0 <- glmmTMB(
+  N_protests ~ Title_check +
+    indigenous_percent2012 +
+    poor_percent2012 + popgrowth_per_year + migration_internal +
+    literacy_percent_no + forested_area_percent +
+    area_total_cultivated + time_to_capital +
+    area_municip + working_age_percent_yes + pop_percent_outside +
+    (1 | Municipality),
+  ziformula = ~ poor_percent2012,
+  family = nbinom2,
+  data = dat
+)
+
+# Nested departments model
+m_dept <- glmmTMB(
+  N_protests ~ Title_check +
+    indigenous_percent2012 +
+    poor_percent2012 + popgrowth_per_year + migration_internal +
+    literacy_percent_no + forested_area_percent +
+    area_total_cultivated + time_to_capital +
+    area_municip + working_age_percent_yes + pop_percent_outside +
+    (1 | NAME_2/Municipality),
+  ziformula = ~ poor_percent2012,
+  family = nbinom2,
+  data = dat
+)
+
+# Lag models
+m_lag1 <- update(m_lag0, . ~ . - Title_check + Title_lag1)
+m_lag2 <- update(m_lag0, . ~ . - Title_check + Title_lag2)
+m_lag3 <- update(m_lag0, . ~ . - Title_check + Title_lag3)
+```
+
+```{r table-models}
+tab_model(
+  m_lag0, m_dept,
+  show.icc    = TRUE,
+  show.re.var = TRUE,
+  transform   = "exp",
+  dv.labels   = c("Baseline", "Nested (Dept/Mun)"),
+  pred.labels = c(
+    Title_check             = "Land titles",
+    indigenous_percent2012  = "% Indigenous",
+    poor_percent2012        = "Poverty %",
+    popgrowth_per_year      = "Population growth",
+    migration_internal      = "Internal migration",
+    literacy_percent_no     = "Illiteracy %",
+    forested_area_percent   = "Forested area %",
+    area_total_cultivated   = "Cultivated area",
+    time_to_capital         = "Time to capital",
+    area_municip            = "Municipality area",
+    working_age_percent_yes = "Working age %",
+    pop_percent_outside     = "Pop. outside urban"
+  ),
+  title = "Zero-inflated negative binomial models: effect of land titling on protests"
+)
+```
+
+Figure 3 shows the predicted effect of land titles. As seen, in the same year as the implementation of TCOs the presence of protests is 70% smaller (p = 0.063). One year after titling, we can no longer identify a clear association between land titles and protests, suggesting that the potential pacifying effect of land titling is short term rather than sustained.
+
+**Figure 3: Effect of land titling on protests by lag structure**
+
+```{r figure3, fig.width=7, fig.height=4}
+lag_plot_data <- bind_rows(
+  tidy(m_lag0, conf.int = TRUE, exponentiate = TRUE) %>%
+    filter(effect == "fixed", component == "cond", term == "Title_check") %>%
+    mutate(lag = "Same year"),
+  tidy(m_lag1, conf.int = TRUE, exponentiate = TRUE) %>%
+    filter(effect == "fixed", component == "cond", term == "Title_lag1") %>%
+    mutate(lag = "One year after"),
+  tidy(m_lag2, conf.int = TRUE, exponentiate = TRUE) %>%
+    filter(effect == "fixed", component == "cond", term == "Title_lag2") %>%
+    mutate(lag = "Two years after"),
+  tidy(m_lag3, conf.int = TRUE, exponentiate = TRUE) %>%
+    filter(effect == "fixed", component == "cond", term == "Title_lag3") %>%
+    mutate(lag = "Three years after")
+) %>%
+  mutate(
+    lag = factor(lag, levels = c("Same year", "One year after",
+                                 "Two years after", "Three years after")),
+    significant = p.value < 0.1
+  )
+
+ggplot(lag_plot_data, aes(x = lag, y = estimate,
+                          ymin = conf.low, ymax = conf.high,
+                          color = significant)) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_pointrange(size = 0.8, linewidth = 1) +
+  scale_color_manual(values = c("TRUE" = "#C0392B", "FALSE" = "#87CEEB"),
+                     labels = c("TRUE" = "p < 0.10", "FALSE" = "p ≥ 0.10"),
+                     name   = NULL) +
+  scale_y_continuous(breaks = seq(0, 2, by = 0.25)) +
+  labs(x = NULL, y = "Incidence Rate Ratio (IRR)",
+       caption = "IRR < 1 indicates fewer protests. Error bars = 95% CI.") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position    = "bottom",
+        panel.grid.minor   = element_blank(),
+        panel.grid.major.x = element_blank())
+```
+
+For the most part, results are inconclusive regarding a long-term effect. But for the immediate effect of land titles, these seem to favor conventional wisdom that they reduce conflict.
+
+### Bayesian measures
+
+We informed the same model with priors that reflect the most intuitive hypothesis of conflict reduction. Bayesian models allow us to estimate an updated degree of belief in each theory, including the null hypothesis. Table 1 describes the statistics.
+
+```{r bayesian-models, results='hide', cache=TRUE}
+base_priors <- c(
+  prior(normal(0, 1),    class = b),
+  prior(normal(0, 10),   class = Intercept),
+  prior(cauchy(0, 2.5),  class = sd),
+  prior(gamma(0.1, 0.1), class = shape)
+)
+
+f <- bf(
+  N_protests ~ Title_check +
+    indigenous_percent2012 + poor_percent2012 + popgrowth_per_year +
+    migration_internal + literacy_percent_no + forested_area_percent +
+    area_total_cultivated + time_to_capital + area_municip +
+    working_age_percent_yes + pop_percent_outside +
+    (1 | Municipality)
+)
+
+m_neutral <- brm(f, family = negbinomial(), data = dat,
+  prior = c(base_priors, prior(normal(0, 1), class = b, coef = "Title_check")),
+  chains = 4, iter = 2000, warmup = 1000, cores = 4, seed = 42,
+  control = list(adapt_delta = 0.95))
+
+m_mild <- brm(f, family = negbinomial(), data = dat,
+  prior = c(base_priors, prior(normal(-0.3, 0.5), class = b, coef = "Title_check")),
+  chains = 4, iter = 2000, warmup = 1000, cores = 4, seed = 42,
+  control = list(adapt_delta = 0.95))
+
+m_strong <- brm(f, family = negbinomial(), data = dat,
+  prior = c(base_priors, prior(normal(-0.5, 0.5), class = b, coef = "Title_check")),
+  chains = 4, iter = 2000, warmup = 1000, cores = 4, seed = 42,
+  control = list(adapt_delta = 0.95))
+```
+
+**Table 1: Posterior probabilities of hypotheses given data**
+
+```{r table1}
+theory_probs <- function(model, rope = 0.05) {
+  post <- as_draws_df(model)
+  tibble(
+    `H1: Reduce Protest`  = paste0(round(mean(post$b_Title_check < -rope) * 100, 1), "%"),
+    `H0: No Effect`       = paste0(round(mean(abs(post$b_Title_check) <= rope) * 100, 1), "%"),
+    `H2: Increase Protest`= paste0(round(mean(post$b_Title_check > rope) * 100, 1), "%")
+  )
+}
+
+bind_rows(
+  "Neutral prior"       = theory_probs(m_neutral),
+  "Mild negative prior" = theory_probs(m_mild),
+  "Strong negative prior" = theory_probs(m_strong),
+  .id = " "
+) %>%
+  knitr::kable()
+```
+
+None of the hypotheses is highly likely, however the data seem more consistent with conventional wisdom once more. One clear take away from the data is that the sharp null is unlikely, i.e. it much less reasonable to assume that TCOs have no effect on protest if compared to the other theories. It is also noteworthy that it is not unlikely that the mechanism described by Fontana (2014) applies more generally in Bolivia, as probabilities between 31% and 38% can be considered fairly high. In the next section we discuss what these new information may say about the case of Apolo and about the possible external validity of the mechanisms estimated for explaining conflict there.
+
+### The Apolo municipality in face of new evidence
+
+# Appendix
+
+
+Here we explain how predixtive models were specified. 
+
+## Zero-Inflated Negative Binomial Model
+
+Let $y_{it}$ denote the number of protests in municipality $i$ in year $t$. 
+The distribution of protest counts exhibits two features that motivate our 
+modeling choice. First, the variance substantially exceeds the mean 
+(overdispersion), violating the equidispersion assumption of the Poisson 
+distribution. Second, 93% of municipality-year observations record zero 
+protests, far exceeding what a standard count distribution would predict.
+
+We therefore model $y_{it}$ as a zero-inflated negative binomial (ZINB), 
+which combines two processes:
+
+$$
+y_{it} \sim \begin{cases} 0 & \text{with probability } \pi_{it} \\ \text{NegBin}(\mu_{it}, \phi) & \text{with probability } 1 - \pi_{it} \end{cases}
+$$
+
+where $\pi_{it}$ is the probability of a **structural zero** (a municipality 
+where protest is organizationally or structurally impossible), $\mu_{it}$ is 
+the expected count for municipalities capable of protest, and $\phi$ is the 
+overdispersion parameter. The negative binomial variance is 
+$\text{Var}(y_{it}) = \mu_{it} + \mu_{it}^2/\phi$, which reduces to Poisson 
+as $\phi \rightarrow \infty$.
+
+**Structural zero process.** The probability of a structural zero is modeled 
+as a logistic function of poverty:
+
+$$
+\text{logit}(\pi_{it}) = \gamma_0 + \gamma_1 \cdot \text{Poverty}_{i}
+$$
+
+**Conditional count process.** For municipalities capable of protest, the 
+expected count is:
+
+$$
+\log(\mu_{it}) = \alpha_i + \beta_1 \cdot \text{Titles}_{it} + \mathbf{X}_{it}'\boldsymbol{\beta} 
+$$
+
+where $\alpha_i \sim \mathcal{N}(0, \sigma^2_\alpha)$ is a municipality-level 
+random intercept capturing unobserved heterogeneity, $\text{Titles}_{it}$ is 
+the number of land titles issued in municipality $i$ in year $t$, and 
+$\mathbf{X}_{it}$ is a vector of controls including indigenous population 
+share, poverty rate, population growth, internal migration, illiteracy rate, 
+forested area, cultivated area, travel time to the departmental capital, 
+municipal area, working-age population share, and share of population outside 
+urban centers.
+
+The key parameter of interest is $\beta_1$. Exponentiating gives the 
+**incidence rate ratio** (IRR): $\exp(\beta_1) < 1$ indicates that titling 
+is associated with fewer protests, consistent with conventional wisdom; 
+$\exp(\beta_1) > 1$ would support the conflict-increasing hypothesis.
+
+A second specification adds a department-level random intercept 
+$\delta_d \sim \mathcal{N}(0, \sigma^2_\delta)$, nesting municipalities 
+within departments:
+
+$$
+\log(\mu_{it}) = \alpha_i + \delta_{d[i]} + \beta_1 \cdot \text{Titles}_{it} + \mathbf{X}_{it}'\boldsymbol{\beta}
+$$
+
+## Bayesian Negative Binomial Model
+
+To formally contrast three competing theories — pacification 
+($\beta_1 < 0$), null effect ($\beta_1 \approx 0$), and mobilization 
+($\beta_1 > 0$) — we estimate a Bayesian version of the same model. The 
+likelihood is:
+
+$$
+y_{it} \mid \mu_{it}, \phi \sim \text{NegBin}(\mu_{it}, \phi)
+$$
+
+$$
+\log(\mu_{it}) = \alpha_i + \beta_1 \cdot \text{Titles}_{it} + \mathbf{X}_{it}'\boldsymbol{\beta}
+$$
+
+We conduct a prior sensitivity analysis using three specifications for 
+$\beta_1$, reflecting increasing confidence in the pacification hypothesis:
+
+$$
+\beta_1 \sim \begin{cases} \mathcal{N}(0,\ 1) & \text{neutral prior} \\ \mathcal{N}(-0.3,\ 0.5) & \text{mild negative prior} \\ \mathcal{N}(-0.5,\ 0.5) & \text{strong negative prior} \end{cases}
+$$
+
+Remaining priors are weakly informative: $\boldsymbol{\beta} \sim \mathcal{N}(0, 1)$, 
+$\alpha_0 \sim \mathcal{N}(0, 10)$, $\sigma_\alpha \sim \text{Half-Cauchy}(0, 2.5)$, 
+and $\phi \sim \text{Gamma}(0.1, 0.1)$.
+
+Posterior inference is based on 4 chains of 2,000 iterations (1,000 warmup). 
+We summarize the posterior distribution of $\beta_1$ by computing the 
+probability mass in each theoretical region, using a region of practical 
+equivalence (ROPE) of $|\beta_1| \leq 0.05$ to define the null:
+
+$$
+P(\text{Pacification} \mid \mathbf{y}) = P(\beta_1 < -0.05 \mid \mathbf{y})
+$$
+$$
+P(\text{Null} \mid \mathbf{y}) = P(|\beta_1| \leq 0.05 \mid \mathbf{y})
+$$
+$$
+P(\text{Mobilization} \mid \mathbf{y}) = P(\beta_1 > 0.05 \mid \mathbf{y})
+$$
+
+```{r appendix-table}
+tab_model(
+  m_lag0, m_dept,
+  show.icc    = TRUE,
+  show.re.var = TRUE,
+  transform   = "exp",
+  dv.labels   = c("Baseline", "Nested (Dept/Mun)"),
+  pred.labels = c(
+    Title_check             = "Land titles",
+    indigenous_percent2012  = "% Indigenous",
+    poor_percent2012        = "Poverty %",
+    popgrowth_per_year      = "Population growth",
+    migration_internal      = "Internal migration",
+    literacy_percent_no     = "Illiteracy %",
+    forested_area_percent   = "Forested area %",
+    area_total_cultivated   = "Cultivated area",
+    time_to_capital         = "Time to capital",
+    area_municip            = "Municipality area",
+    working_age_percent_yes = "Working age %",
+    pop_percent_outside     = "Pop. outside urban"
+  )
+)
+```
